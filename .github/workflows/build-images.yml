@@ -1,0 +1,116 @@
+# Build + publish all 10 MOSAIC benchmark app images to GHCR.
+#
+# Triggered by:
+#   - Pushing a tag matching v*.*.* (e.g., v0.1.0)
+#   - Manual workflow_dispatch (with explicit version input)
+#
+# After a successful run, reviewers can `mosaic run -c <chain>` and the
+# images will be pulled automatically from ghcr.io instead of built locally.
+
+name: Build & publish benchmark images
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image version tag (e.g., v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: ${{ matrix.task.id }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        task:
+          - { id: task_amsgames_laravel_shop__catalog_and_cart,             dir: amsgames_laravel-shop }
+          - { id: task_ankur_anand_simple_sso__sso_server,                  dir: ankur-anand_simple-sso }
+          - { id: task_attacomsian_code_examples__file_upload_apis,         dir: attacomsian_code-examples }
+          - { id: task_dailycodebuffer_spring_mvc_tutorials__book_catalog,  dir: dailycodebuffer_Spring-MVC-Tutorials }
+          - { id: task_hagopj13_node_express_boilerplate__users,            dir: hagopj13_node-express-boilerplate }
+          - { id: task_haozhang95_python24__cart_apis,                      dir: HaoZhang95_Python24 }
+          - { id: task_izghua_go_blog__console_authentication,              dir: izghua_go-blog }
+          - { id: task_nhost_hasura_auth__authentication,                   dir: nhost_hasura-auth }
+          - { id: task_stripe_samples_accept_a_payment__payment_lifecycle,  dir: stripe-samples_accept-a-payment/custom-payment-flow }
+          - { id: task_swaggo_swag__accounts,                               dir: swaggo_swag }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version tag
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve image name (lowercase, hyphens)
+        id: img
+        run: |
+          SAFE_ID="$(echo '${{ matrix.task.id }}' | tr '_' '-' | tr 'A-Z' 'a-z')"
+          OWNER="$(echo '${{ github.repository_owner }}' | tr 'A-Z' 'a-z')"
+          echo "ref=ghcr.io/${OWNER}/mosaic-bench/${SAFE_ID}:${{ steps.ver.outputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install mosaic-bench (for `mosaic init`)
+        run: pip install --quiet -e .
+
+      - name: Download ABC-Bench app for ${{ matrix.task.id }}
+        env:
+          # MosaicBenchmark/mosaic-bench is private during the NeurIPS review
+          # window; HF_TOKEN comes from a repo secret.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+          MOSAIC_INIT_TASKS: ${{ matrix.task.id }}
+        run: |
+          # Apply overlays manually after init since `mosaic init --subset` only
+          # accepts predefined subset names; we filter to the matrix task post-extract.
+          mosaic init --method snapshot --subset benchmark --force
+          ls -la benchmark/apps/${{ matrix.task.id }}/${{ matrix.task.dir }} | head -5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push runtime image
+        uses: docker/build-push-action@v5
+        with:
+          context: benchmark/apps/${{ matrix.task.id }}/${{ matrix.task.dir }}
+          push: true
+          tags: ${{ steps.img.outputs.ref }}
+          cache-from: type=gha,scope=${{ matrix.task.id }}
+          cache-to: type=gha,scope=${{ matrix.task.id }},mode=max
+          provenance: false
+
+      # For Go apps, also publish a builder-stage image
+      - name: Build & push builder image (Go apps only)
+        if: contains(fromJSON('["task_swaggo_swag__accounts","task_izghua_go_blog__console_authentication","task_nhost_hasura_auth__authentication"]'), matrix.task.id)
+        uses: docker/build-push-action@v5
+        with:
+          context: benchmark/apps/${{ matrix.task.id }}/${{ matrix.task.dir }}
+          target: builder
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/mosaic-bench/${{ matrix.task.id }}-builder:${{ steps.ver.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.task.id }}-builder
+          cache-to: type=gha,scope=${{ matrix.task.id }}-builder,mode=max
+          provenance: false
